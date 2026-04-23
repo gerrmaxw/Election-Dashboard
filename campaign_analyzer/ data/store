@@ -1,0 +1,100 @@
+"""SQLite persistence with idempotent upserts."""
+from __future__ import annotations
+import sqlite3
+import json
+from datetime import datetime, date
+from pathlib import Path
+from typing import Any, Optional
+import sys
+import os
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+from config.settings import DB_PATH
+
+
+def _get_conn(db_path: Path = DB_PATH) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def init_db(db_path: Path = DB_PATH) -> None:
+    conn = _get_conn(db_path)
+    with conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS races (
+                race_id     TEXT PRIMARY KEY,
+                state       TEXT NOT NULL,
+                office      TEXT NOT NULL,
+                district    TEXT,
+                race_name   TEXT NOT NULL,
+                primary_date TEXT,
+                source      TEXT DEFAULT 'civicapi',
+                updated_at  TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS candidates (
+                candidate_id    TEXT PRIMARY KEY,
+                race_id         TEXT REFERENCES races(race_id),
+                name            TEXT NOT NULL,
+                party           TEXT,
+                state           TEXT NOT NULL,
+                office          TEXT NOT NULL,
+                district        TEXT,
+                incumbent       INTEGER DEFAULT 0,
+                votes           INTEGER,
+                vote_share      REAL,
+                won             INTEGER,
+                margin          REAL,
+                fec_committee_id TEXT,
+                updated_at      TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_candidates_state ON candidates(state);
+            CREATE INDEX IF NOT EXISTS idx_candidates_name  ON candidates(name);
+
+            CREATE TABLE IF NOT EXISTS spend_records (
+                record_id       TEXT PRIMARY KEY,
+                candidate_id    TEXT REFERENCES candidates(candidate_id),
+                advertiser_name TEXT NOT NULL,
+                cycle           INTEGER DEFAULT 2026,
+                state           TEXT,
+                race_name       TEXT,
+                medium          TEXT NOT NULL,
+                market          TEXT,
+                spend           REAL NOT NULL,
+                start_date      TEXT,
+                end_date        TEXT,
+                match_source    TEXT DEFAULT 'direct',
+                confidence      REAL DEFAULT 1.0,
+                source_file     TEXT,
+                updated_at      TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_spend_candidate ON spend_records(candidate_id);
+            CREATE INDEX IF NOT EXISTS idx_spend_advertiser ON spend_records(advertiser_name);
+
+            CREATE TABLE IF NOT EXISTS geo_overlap (
+                dma_code    TEXT,
+                dma_name    TEXT,
+                state       TEXT,
+                district    TEXT,
+                overlap_pct REAL NOT NULL,
+                PRIMARY KEY (dma_code, state, district)
+            );
+
+            CREATE TABLE IF NOT EXISTS campaign_rollup (
+                candidate_id    TEXT PRIMARY KEY,
+                candidate_name  TEXT NOT NULL,
+                party           TEXT,
+                state           TEXT,
+                office          TEXT,
+                district        TEXT,
+                primary_date    TEXT,
+                won             INTEGER,
+                votes           INTEGER,
+                vote_share      REAL,
+                margin          REAL,
