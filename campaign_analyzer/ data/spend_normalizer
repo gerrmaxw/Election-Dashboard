@@ -1,0 +1,100 @@
+"""LLM agent for messy spend file column mapping using the Anthropic Claude API."""
+from __future__ import annotations
+import json
+from typing import Optional
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+from config.settings import ANTHROPIC_API_KEY, CANONICAL_MEDIA
+
+CANONICAL_COLUMNS = [
+    "cycle", "state", "race_name", "candidate_name", "party",
+    "medium", "market", "spend", "start_date", "end_date",
+]
+
+MEDIUM_ALIASES: dict[str, str] = {
+    # Broadcast TV
+    "broadcast": "Broadcast TV", "broadcast tv": "Broadcast TV", "tv": "Broadcast TV",
+    "television": "Broadcast TV", "ota": "Broadcast TV", "over-the-air": "Broadcast TV",
+    "spot tv": "Broadcast TV",
+    # Cable
+    "cable": "Cable", "cable tv": "Cable", "ctv": "Cable",
+    # Streaming
+    "streaming": "Streaming", "ott": "Streaming", "connected tv": "Streaming",
+    "hulu": "Streaming", "youtube tv": "Streaming", "addressable": "Streaming",
+    # Digital
+    "digital": "Digital", "online": "Digital", "internet": "Digital",
+    "social": "Digital", "social media": "Digital", "meta": "Digital",
+    "google": "Digital", "programmatic": "Digital", "display": "Digital",
+    # Radio
+    "radio": "Radio", "audio": "Radio", "podcast": "Radio", "pandora": "Radio",
+    "spotify": "Radio",
+    # Mail
+    "mail": "Mail", "direct mail": "Mail", "mailer": "Mail",
+    # Other
+    "outdoor": "Other", "out of home": "Other", "ooh": "Other",
+    "print": "Other", "newspaper": "Other", "phone": "Other",
+    "other": "Other",
+}
+
+
+def normalize_medium(raw: str) -> str:
+    """Case-insensitive match raw medium string to canonical value."""
+    key = raw.strip().lower()
+    return MEDIUM_ALIASES.get(key, "Other")
+
+
+def _build_mapping_prompt(columns: list[str], sample_rows: list[list]) -> str:
+    sample_str = "\n".join(str(row) for row in sample_rows[:5])
+    return f"""You are a data mapping assistant for a political advertising analytics tool.
+
+The user has uploaded a spend file with these columns:
+{json.dumps(columns)}
+
+Here are the first few data rows:
+{sample_str}
+
+Map each source column to one of these canonical target columns (or null if no match):
+{json.dumps(CANONICAL_COLUMNS)}
+
+Also identify any columns that represent advertising medium spend amounts.
+For medium columns, map to one of these canonical media:
+{json.dumps(CANONICAL_MEDIA)}
+
+Return ONLY valid JSON in this exact format:
+{{
+  "column_mapping": {{
+    "<source_col>": "<canonical_col_or_null>"
+  }},
+  "medium_columns": {{
+    "<source_col>": "<canonical_medium>"
+  }},
+  "notes": "<brief explanation of any ambiguous mappings>"
+}}"""
+
+
+def llm_map_columns(
+    columns: list[str],
+    sample_rows: list[list],
+    model: str = "claude-sonnet-4-6",
+) -> dict:
+    """Use Claude to map source file columns to canonical schema.
+
+    Falls back to heuristic mapping if the API key is absent.
+    """
+    if not ANTHROPIC_API_KEY:
+        return _heuristic_map(columns)
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        prompt = _build_mapping_prompt(columns, sample_rows)
+        message = client.messages.create(
+            model=model,
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        content = message.content[0].text
+        # Extract JSON block
+        start = content.find("{")
