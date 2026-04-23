@@ -1,0 +1,100 @@
+"""OpenFEC + CivicAPI clients."""
+from __future__ import annotations
+import time
+import hashlib
+import requests
+from typing import Optional
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+from config.settings import FEC_API_KEY, CIVIC_API_KEY, FEC_ELECTION_YEAR, FEC_BATCH_SIZE
+
+
+class RateLimiter:
+    def __init__(self, calls_per_second: float = 2.0):
+        self._min_interval = 1.0 / calls_per_second
+        self._last_call = 0.0
+
+    def wait(self):
+        elapsed = time.monotonic() - self._last_call
+        if elapsed < self._min_interval:
+            time.sleep(self._min_interval - elapsed)
+        self._last_call = time.monotonic()
+
+
+_fec_limiter = RateLimiter(calls_per_second=1.5)
+_civic_limiter = RateLimiter(calls_per_second=2.0)
+
+FEC_BASE = "https://api.open.fec.gov/v1"
+CIVIC_BASE = "https://www.googleapis.com/civicinfo/v2"
+
+
+def _fec_get(path: str, params: dict, retries: int = 3) -> dict:
+    params = {**params, "api_key": FEC_API_KEY}
+    for attempt in range(retries):
+        _fec_limiter.wait()
+        try:
+            r = requests.get(f"{FEC_BASE}{path}", params=params, timeout=30)
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            if attempt == retries - 1:
+                raise
+            time.sleep(2 ** attempt)
+    return {}
+
+
+def fetch_fec_schedule_e(
+    cycle: int = FEC_ELECTION_YEAR,
+    per_page: int = FEC_BATCH_SIZE,
+    last_index: Optional[str] = None,
+    last_expenditure_date: Optional[str] = None,
+) -> dict:
+    """Fetch one page of Schedule E independent expenditures.
+    Uses raw /schedules/schedule_e/ — NOT /schedules/schedule_e/by_candidate/.
+    """
+    params: dict = {
+        "cycle": cycle,
+        "per_page": per_page,
+        "sort": "expenditure_date",
+        "sort_hide_null": "true",
+    }
+    if last_index:
+        params["last_index"] = last_index
+    if last_expenditure_date:
+        params["last_expenditure_date"] = last_expenditure_date
+    return _fec_get("/schedules/schedule_e/", params)
+
+
+def fetch_fec_candidate(candidate_id: str) -> dict:
+    data = _fec_get(f"/candidate/{candidate_id}/", {"cycle": FEC_ELECTION_YEAR})
+    results = data.get("results", [])
+    return results[0] if results else {}
+
+
+def fetch_fec_committees_for_candidate(candidate_id: str) -> list[dict]:
+    data = _fec_get("/committees/", {
+        "candidate_id": candidate_id,
+        "cycle": FEC_ELECTION_YEAR,
+        "per_page": 20,
+    })
+    return data.get("results", [])
+
+
+# ---------------------------------------------------------------------------
+# CivicAPI
+# ---------------------------------------------------------------------------
+
+def fetch_civicapi_elections(state: str) -> list[dict]:
+    """Fetch election contests for a state from the Google Civic Information API."""
+    if not CIVIC_API_KEY:
+        return []
+    _civic_limiter.wait()
+    try:
+        r = requests.get(
+            f"{CIVIC_BASE}/elections",
+            params={"key": CIVIC_API_KEY},
+            timeout=20,
+        )
+        r.raise_for_status()
