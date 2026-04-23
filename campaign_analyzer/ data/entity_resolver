@@ -1,0 +1,100 @@
+"""Rapidfuzz candidate name matching with FEC committee fallback."""
+from __future__ import annotations
+from typing import Optional
+import sys
+from pathlib import Path
+
+try:
+    from rapidfuzz import fuzz, process
+    _HAS_RAPIDFUZZ = True
+except ImportError:
+    _HAS_RAPIDFUZZ = False
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+from campaign_analyzer.data.store import query, fetch_all
+from config.settings import PAC_CONFIDENCE_DISCOUNT
+
+
+def _normalize(name: str) -> str:
+    """Lowercase, strip punctuation and common suffixes."""
+    import re
+    name = name.lower()
+    name = re.sub(r"\b(for|committee|congress|senate|house|campaign|friends of|elect)\b", "", name)
+    name = re.sub(r"[^a-z0-9 ]", " ", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name
+
+
+def match_advertiser_to_candidate(
+    advertiser_name: str,
+    state: Optional[str] = None,
+    threshold: float = 80.0,
+) -> Optional[dict]:
+    """Try to match an advertiser name to a candidate in SQLite.
+
+    Steps:
+    1. Direct name match (normalized) against candidates table.
+    2. FEC committee name match against fec_ie_by_committee.
+    Returns a dict with candidate_id, candidate_name, confidence, match_source.
+    """
+    candidates = fetch_all("candidates")
+    if state:
+        candidates = [c for c in candidates if c.get("state") == state]
+
+    if not candidates:
+        return None
+
+    if _HAS_RAPIDFUZZ:
+        names = [_normalize(c["name"]) for c in candidates]
+        query_norm = _normalize(advertiser_name)
+        result = process.extractOne(query_norm, names, scorer=fuzz.token_set_ratio, score_cutoff=threshold)
+        if result:
+            matched_name, score, idx = result
+            c = candidates[idx]
+            return {
+                "candidate_id": c["candidate_id"],
+                "candidate_name": c["name"],
+                "confidence": round(score / 100.0, 3),
+                "match_source": "direct",
+            }
+    else:
+        # Fallback: simple substring matching
+        query_norm = _normalize(advertiser_name)
+        for c in candidates:
+            if _normalize(c["name"]) in query_norm or query_norm in _normalize(c["name"]):
+                return {
+                    "candidate_id": c["candidate_id"],
+                    "candidate_name": c["name"],
+                    "confidence": 0.85,
+                    "match_source": "direct",
+                }
+
+    # FEC IE fallback: check committee names
+    fec_rows = fetch_all("fec_ie_by_committee")
+    if state:
+        # Filter to candidates in the state (requires join, approximate via name)
+        pass  # best-effort without join
+
+    if _HAS_RAPIDFUZZ:
+        fec_names = [_normalize(r["committee_name"]) for r in fec_rows]
+        query_norm = _normalize(advertiser_name)
+        result = process.extractOne(query_norm, fec_names, scorer=fuzz.token_set_ratio,
+                                    score_cutoff=threshold - 10)
+        if result:
+            _, score, idx = result
+            fec_row = fec_rows[idx]
+            # Find top-supported candidate for this committee
+            top = _top_supported_candidate(fec_row["committee_id"])
+            if top:
+                return {
+                    "candidate_id": top["candidate_id"],
+                    "candidate_name": top["candidate_name"],
+                    "confidence": round(score / 100.0 * PAC_CONFIDENCE_DISCOUNT, 3),
+                    "match_source": "fec_ie",
+                }
+
+    return None
+
+
+def _top_supported_candidate(committee_id: str) -> Optional[dict]:
+    """Return the candidate most supported by this committee (highest spend, support direction)."""
