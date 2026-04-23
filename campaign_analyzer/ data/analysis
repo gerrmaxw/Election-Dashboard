@@ -1,0 +1,100 @@
+"""Cohort comparisons, Fisher's exact test, Welch's t-test, matched-cohort stratification."""
+from __future__ import annotations
+import math
+from typing import Optional
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+from campaign_analyzer.data.store import query, fetch_all
+
+
+# ---------------------------------------------------------------------------
+# Medium classification
+# ---------------------------------------------------------------------------
+
+def classify_tv_medium(
+    broadcast_spend: float,
+    cable_spend: float,
+    streaming_spend: float,
+) -> str:
+    """Classify TV medium strategy.
+
+    broadcast_only: broadcast > 0 AND cable == 0 AND streaming == 0.
+    Digital and radio are irrelevant to this classification.
+    """
+    has_broadcast = broadcast_spend > 0
+    has_cable = cable_spend > 0
+    has_streaming = streaming_spend > 0
+
+    if has_broadcast and not has_cable and not has_streaming:
+        return "broadcast_only"
+    if (has_cable or has_streaming) and not has_broadcast:
+        return "cable_ctv_only"
+    if has_broadcast and (has_cable or has_streaming):
+        return "mixed_tv"
+    return "no_tv"
+
+
+# ---------------------------------------------------------------------------
+# Statistical helpers
+# ---------------------------------------------------------------------------
+
+def _mean(values: list[float]) -> Optional[float]:
+    v = [x for x in values if x is not None]
+    return sum(v) / len(v) if v else None
+
+
+def _median(values: list[float]) -> Optional[float]:
+    v = sorted(x for x in values if x is not None)
+    n = len(v)
+    if n == 0:
+        return None
+    mid = n // 2
+    return v[mid] if n % 2 else (v[mid - 1] + v[mid]) / 2.0
+
+
+def _variance(values: list[float]) -> Optional[float]:
+    v = [x for x in values if x is not None]
+    n = len(v)
+    if n < 2:
+        return None
+    m = sum(v) / n
+    return sum((x - m) ** 2 for x in v) / (n - 1)
+
+
+def welchs_t_test(a: list[float], b: list[float]) -> dict:
+    """Two-sided Welch's t-test. Returns t-stat, df, and p-value approximation."""
+    a = [x for x in a if x is not None]
+    b = [x for x in b if x is not None]
+    na, nb = len(a), len(b)
+    if na < 2 or nb < 2:
+        return {"t": None, "df": None, "p": None, "na": na, "nb": nb}
+
+    ma, mb = sum(a) / na, sum(b) / nb
+    va = sum((x - ma) ** 2 for x in a) / (na - 1)
+    vb = sum((x - mb) ** 2 for x in b) / (nb - 1)
+
+    se = math.sqrt(va / na + vb / nb)
+    if se == 0:
+        return {"t": 0.0, "df": na + nb - 2, "p": 1.0, "na": na, "nb": nb}
+
+    t = (ma - mb) / se
+    # Welch–Satterthwaite df
+    num = (va / na + vb / nb) ** 2
+    denom = (va / na) ** 2 / (na - 1) + (vb / nb) ** 2 / (nb - 1)
+    df = num / denom if denom else na + nb - 2
+
+    # Two-sided p-value approximation (rough — avoid scipy dependency)
+    p = _t_pvalue_approx(abs(t), df)
+    return {"t": round(t, 4), "df": round(df, 1), "p": round(p, 4), "na": na, "nb": nb,
+            "mean_a": round(ma, 2), "mean_b": round(mb, 2)}
+
+
+def _t_pvalue_approx(t_abs: float, df: float) -> float:
+    """Very rough two-sided p-value from t-distribution using normal approximation."""
+    # Cornish-Fisher approximation for large df; normal for simplicity
+    import math
+    z = t_abs
+    p_one = 0.5 * math.erfc(z / math.sqrt(2))
+    return min(1.0, 2 * p_one)
